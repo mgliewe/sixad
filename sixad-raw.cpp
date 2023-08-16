@@ -27,12 +27,16 @@ int main(int argc, char **argv)
 {
     int i, fd, nr;
     unsigned char buf[128];
+    const char * profile = "hidraw"; 
     struct uinput_fd *ufd;
     struct device_settings settings;
 
-    if (argc < 2) {
-        std::cout << "Usage: " << argv[0] << " /dev/hidrawX" << std::endl;
+    if (argc < 2 || argc>3) {
+        std::cout << "Usage: " << argv[0] << " /dev/hidrawX [profile-name]" << std::endl;
         return 1;
+    }
+    if (argc==3) {
+        profile = argv[2];
     }
 
     if ((fd = open(argv[1], O_RDONLY)) < 0) {
@@ -51,7 +55,7 @@ int main(int argc, char **argv)
     }
 
     open_log("sixad-raw");
-    settings = init_values("hidraw");
+    settings = init_values(profile);
 
     // hidraw has no rumble/led support
     settings.remote.enabled = false;

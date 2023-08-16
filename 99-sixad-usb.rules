@@ -1,0 +1,4 @@
+
+# send attach event to sixad usb daemon
+KERNEL=="hidraw*", ACTION=="add", ATTRS{product}=="PLAYSTATION(R)3 Controller", RUN+="/usr/sbin/sixad-usbd --attach %k"
+
