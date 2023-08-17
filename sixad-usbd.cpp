@@ -40,9 +40,7 @@ FILE *pid_file = NULL;
 #define STD_FIFO_PATH "/var/run/sixad-usbd.ctl"
 
 #define DEV_PATH            "/dev/%s"
-#define SYS_HID_INFO_PATH   "/sys/class/hidraw/%s/device/uevent"
-#define HID_NAME            "HID_NAME=Sony PLAYSTATION(R)3 Controller"
-#define HID_UNIQ            "HID_UNIQ="
+#define HID_NAME            "Sony PLAYSTATION(R)3 Controller"
 
 #define DEFAULT_PROFILE     "hidraw"
 #define PROFILE_PATH        "/var/lib/sixad/profiles/%s"
@@ -388,6 +386,10 @@ void release_controller(struct controller_info * ctrl) {
     delete ctrl;
 }
 
+#include <linux/hidraw.h>
+
+#define SIXAXIS_REPORT_0xF2_SIZE 17
+
 struct controller_info *get_controller(char *dev, char *profile) {
     char path[PATH_MAX];
     struct controller_info *ctrl;
@@ -404,37 +406,26 @@ struct controller_info *get_controller(char *dev, char *profile) {
         return NULL;
     }
 
-    snprintf(path, PATH_MAX, SYS_HID_INFO_PATH, dev);
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        release_controller(ctrl);
-        return NULL;
-    }
+    int fd=open(ctrl->dev_path, O_RDWR);
+    unsigned char *buffer;
 
-    int name_ok = 0;
-    while(!feof(fp)) {
-        char line[100];
-        if (!fgets(line, 100, fp)) {
-            break;
-        }
-        if (strncmp(line, HID_NAME, strlen(HID_NAME)) == 0) 
-            name_ok = 1;
-        if (strncmp(line, HID_UNIQ, strlen(HID_UNIQ)) == 0) {
-            int len = strlen(line) - strlen(HID_UNIQ); 
-            if (line[len-1] == '\n') {
-                len --;
-            }
-            char *p = (char *) malloc(len+1);
-            assert( p!=0 );
-            strncpy(p, line+strlen(HID_UNIQ), len-1);
-            ctrl->uniq_id = p;
-        }
-    }
-    fclose(fp);
-    if (!name_ok) {
+
+    buffer = (unsigned char *) calloc(1, 32);
+    ioctl(fd, HIDIOCGRAWNAME(32), buffer);
+    if (strcmp((char *) buffer, HID_NAME)!=0) {
+        free(buffer);
         release_controller(ctrl);
         return NULL;
-    }
+    } 
+
+    buffer[0]=0xf2;
+    ioctl(fd, HIDIOCGFEATURE(SIXAXIS_REPORT_0xF2_SIZE), buffer);
+
+    ctrl->uniq_id = (char *) malloc(18);
+    sprintf(ctrl->uniq_id, "%02x:%02x:%02x:%02x:%02x:%02x", buffer[4], buffer[5], buffer[6], buffer[7], buffer[8], buffer[9]);
+
+    free(buffer);
+    close(fd);
 
     const char *p;
     if (!profile) {
@@ -677,12 +668,34 @@ int main(int argc, char * const argv[]) {
         }
 
         init_threading();
-        
+
+        DIR *dir;
+        struct dirent *entry;
+        dir = opendir("/dev");
+        if (dir) {
+            for (;;) {
+                entry = readdir(dir);
+                if (!entry)  break;
+
+                if (strncmp("hidraw", entry->d_name, 6)==0) {
+                    struct controller_info *ctrl;
+                    ctrl = get_controller(entry->d_name, NULL);
+                    if (ctrl) {
+                        int err = pthread_create(&ctrl->thread_id, NULL, controller_thread, ctrl);
+                        if (err) {
+                            error("internal error: cannot create controller thread: %s", strerror(err));
+                        }                        
+                    }
+                }
+            }
+            closedir(dir);
+        }
+
+
         info("sixad-usbd listening on %s", fifo_path);
         for(int quit=0;!quit;) {
             char line[80];
             char *cmd=0, *dev=0, *profile=0;
-            pthread_t thread_id;
             int err;
 
             if (read_fifo(line, 80)) {
@@ -708,8 +721,7 @@ int main(int argc, char * const argv[]) {
 
                     struct controller_info *ctrl = get_controller(dev, profile);
                     if (ctrl) {
-                        ctrl->thread_id = thread_id;
-                        err = pthread_create(&thread_id, NULL, controller_thread, ctrl);
+                        err = pthread_create(&ctrl->thread_id, NULL, controller_thread, ctrl);
                         if (err) {
                             error("internal error: cannot create controller thread: %s", strerror(err));
                         }
