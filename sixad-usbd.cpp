@@ -19,18 +19,31 @@
 #include "sixaxis.h"
 #include "uinput.h"
 
-#define SYSLOG_NAME "sixad-usbd"
+#include <linux/hidraw.h>
+
+// this is taken from linux kernel driver
+#define SIXAXIS_REPORT_0xF2_SIZE 17
 
 #define OK 1
 #define FAIL 0
 
-enum {
+/* logging facilities */
+#define SYSLOG_NAME "sixad-usbd"
+
+enum log_type {
     LOG_STDERR = 0,
     LOG_FILE,
     LOG_TOSYSLOG
 } log_type = LOG_STDERR;
 
 char *log_filename = NULL;
+
+static void debug(const char *fmt, ...);
+static void info(const char *fmt, ...);
+static void fatal(const char *fmt, ...);
+static void error(const char *fmt, ...);
+static void warning(const char *fmt, ...);
+
 char *profile_name = NULL;
 char *dev_name = NULL;
 char *fifo_path = NULL;
@@ -62,9 +75,15 @@ struct controller_info {
 
 pthread_mutex_t ctrl_list_mutex;
 
+void sighup(int s);
+void sigint(int s);
+int daemonize();
+bool write_pidfile();
+void unlink_pidfile();
 
 void sighup(int s) {
-
+}
+void sigint(int s) {
 }
 
 int daemonize() {
@@ -72,25 +91,33 @@ int daemonize() {
 
     /* Fork off the parent process */
     pid = fork();
-    if (pid < 0)
+    if (pid < 0) {
+        fatal("fork() failed: %s", strerror(errno));
         exit(EXIT_FAILURE);
+    }
 
     /* Let the parent terminate */
     if (pid > 0)
         exit(EXIT_SUCCESS);
 
     /* The child process becomes session leader */
-    if (setsid() < 0)
+    if (setsid() < 0) {
+        fatal("setsid() failed: %s", strerror(errno));
         exit(EXIT_FAILURE);
+    }
 
     /* Catch, ignore and handle signals */
     signal(SIGCHLD, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGHUP, sighup);
+    signal(SIGINT, sigint);
 
     /* Fork off for the second time*/
     pid = fork();
-    if (pid < 0)
+    if (pid < 0) {
+        fatal("2nd fork() failed: %s", strerror(errno));
         exit(EXIT_FAILURE);
+    }
 
     /* Let the parent terminate */
     if (pid > 0)
@@ -101,12 +128,12 @@ int daemonize() {
 
     /* Change the working directory to the root directory */
     if (chdir("/")) {
+        fatal("could not change working directory: %s", strerror(errno));
+        exit(EXIT_FAILURE);
     }
 
     /* Close all open file descriptors */
-    int x;
-    for (x = sysconf(_SC_OPEN_MAX); x>=0; x--)
-    {
+    for (int x = sysconf(_SC_OPEN_MAX); x>=0; x--) {
         close (x);
     }
 
@@ -119,8 +146,9 @@ bool write_pidfile() {
     }
 
     // open the pid file
-    pid_file = fopen(pid_filename, "rw");
+    pid_file = fopen(pid_filename, "w");
     if (!pid_file) {
+        error("failed to write pidfile: $s", strerror(errno));
         return false;
     }
 
@@ -132,6 +160,7 @@ bool write_pidfile() {
     fl.l_pid = getpid();
     if (fcntl(fileno(pid_file), F_SETLK, &fl) < 0 ) {
         // lock failed.....
+        error("failed to aquire writelock for pidfile, another instance running?");
         fclose(pid_file);
         return false;
     }
@@ -139,6 +168,8 @@ bool write_pidfile() {
     // write pid to file
     int pid = getpid();
     fprintf(pid_file, "%d\n", pid);
+    fflush(pid_file);
+
     return true;
 }
 
@@ -158,8 +189,6 @@ void unlink_pidfile() {
         pid_file = NULL;
     }
 }
-
-static void error(const char *fmt, ...);
 
 static int open_syslog() {
     /* Open the log file */
@@ -305,7 +334,7 @@ int read_fifo(char *buffer, size_t max_length) {
 int check_devname(const char *devname) {
     char path[PATH_MAX];
     struct stat stat_buf;
-return OK;
+
     snprintf(path, PATH_MAX, DEV_PATH, devname);
     if (lstat(path, &stat_buf))
         return FAIL;
@@ -385,10 +414,6 @@ void release_controller(struct controller_info * ctrl) {
     if (ctrl->profile) free(ctrl->profile);
     delete ctrl;
 }
-
-#include <linux/hidraw.h>
-
-#define SIXAXIS_REPORT_0xF2_SIZE 17
 
 struct controller_info *get_controller(char *dev, char *profile) {
     char path[PATH_MAX];
@@ -626,21 +651,13 @@ int main(int argc, char * const argv[]) {
             case 'P': // --pidfile <path>
                 if (pid_filename)
                     free(pid_filename);
-                pid_filename = (char *) malloc(PATH_MAX);
-                assert(pid_filename!=NULL);
-                if (!realpath(optarg, pid_filename)) {
-                    error("cannot resolve pid file path: %s", strerror(errno));
-                }
+                pid_filename = strdup(optarg);
                 break;            
 
             case 'L': // --logfile <path>
                 if (log_filename)
                     free(log_filename);
-                log_filename = (char *) malloc(PATH_MAX);
-                assert(log_filename!=NULL);
-                if (!realpath(optarg, log_filename)) {
-                    error("cannot resolve log file path: %s", strerror(errno));
-                }
+                log_filename = strdup(optarg);
                 break;            
 
             case ':':
@@ -661,8 +678,12 @@ int main(int argc, char * const argv[]) {
                 goto exit_failure;
             if (log_type==LOG_STDERR) {
                 open_syslog();
-            }            
+            }        
         }
+
+        if (pid_filename)
+            write_pidfile();    
+
         if (!make_fifo()) {
             goto exit_failure;
         }
@@ -690,7 +711,6 @@ int main(int argc, char * const argv[]) {
             }
             closedir(dir);
         }
-
 
         info("sixad-usbd listening on %s", fifo_path);
         for(int quit=0;!quit;) {
